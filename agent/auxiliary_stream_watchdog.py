@@ -18,6 +18,19 @@ from typing import Any, Optional
 from agent.sleep_clock import awake_seconds
 
 
+class AuxNoProgressTimeout(TimeoutError):
+    """Zero output within the first-token window: a cheap, fast failure, so critical-path tasks keep
+    the same-provider retry (``auxiliary_error_policy.skip_same_provider_retry``)."""
+
+
+class AuxChatStreamTimeout(TimeoutError):
+    """The chat-completions stream watchdog ended the attempt (its message names the window)."""
+
+
+class AuxChatStreamNoProgressTimeout(AuxChatStreamTimeout, AuxNoProgressTimeout):
+    """The chat stream produced nothing before its first-token window closed."""
+
+
 def _stream_socket(stream: Any) -> Any:
     """The raw socket under an SDK chunk stream (``stream.response`` is the ``httpx.Response``)."""
     from agent.agent_runtime_helpers import _socket_from_response
@@ -122,14 +135,14 @@ class ChatStreamWatchdog:
             timer.cancel()
 
     def timeout_error(self) -> TimeoutError:
-        """Zero-output stalls say "no-progress timeout" (same-provider retry stays allowed, see
-        ``_should_skip_same_provider_retry``); a mid-stream stall goes straight to fallback."""
+        """A zero-output stall is an ``AuxNoProgressTimeout`` (same-provider retry stays allowed); a
+        mid-stream stall goes straight to fallback."""
         elapsed = awake_seconds() - self._started
         if not self.saw_progress:
-            return TimeoutError(
+            return AuxChatStreamNoProgressTimeout(
                 f"Auxiliary chat stream produced no output within {self.first_token_window or 0:.1f}s "
                 f"(no-progress timeout, {elapsed:.1f}s elapsed)")
-        return TimeoutError(
+        return AuxChatStreamTimeout(
             f"Auxiliary chat stream stalled: no new output for {self.window:.1f}s "
             f"({elapsed:.1f}s elapsed, timed out)")
 

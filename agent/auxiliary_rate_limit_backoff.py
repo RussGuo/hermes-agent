@@ -49,9 +49,8 @@ def rate_limit_wait(exc: Exception, attempt: int) -> Optional[float]:
 def rate_limit_retry_rungs(first_err: Exception, client: Any, kwargs: dict[str, Any], label: str):
     """Ladder rungs: wait, then re-send on the same client, up to ``RATE_LIMIT_RETRIES`` times while
     the refusal stays a rate limit. Returns ``(response, None)`` or ``(None, last_err)``."""
-    from agent.auxiliary_client import (
-        _LadderStep, _credential_rung_accepts, _is_payment_error, _is_rate_limit_error, _rung,
-    )
+    from agent import auxiliary_error_policy as aux_errors
+    from agent.auxiliary_client import _LadderStep, _rung
 
     err = first_err
     for attempt in range(1, RATE_LIMIT_RETRIES + 1):
@@ -63,9 +62,9 @@ def rate_limit_retry_rungs(first_err: Exception, client: Any, kwargs: dict[str, 
         logger.info("Auxiliary %s: rate limited (attempt %d/%d); retrying after %.2fs",
                     label, attempt, RATE_LIMIT_RETRIES, wait)
         yield _LadderStep("wait", (wait,))
-        resp, err = yield from _rung(_LadderStep("call", (client, kwargs)), _credential_rung_accepts)
+        resp, err = yield from _rung(_LadderStep("call", (client, kwargs)), aux_errors.ladder_accepts)
         if err is None:
             return resp, None
-        if not _is_rate_limit_error(err) or _is_payment_error(err):
+        if not aux_errors.same_key_retry(err):
             break
     return None, err

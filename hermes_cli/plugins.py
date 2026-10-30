@@ -124,7 +124,7 @@ VALID_HOOKS: set[str] = {
     "pre_auxiliary_call", "post_auxiliary_call",
     # transform_api_error_classification: once per failed API call BEFORE
     # agent/error_classifier.classify_api_error(). Kwargs: provider, model, status_code, error_type,
-    # error_code, error_message, error_body, error, approx_tokens, context_length, num_messages.
+    # error_code, error_message, error_body, error, approx_tokens, context_length, num_messages, call_id.
     # Return None or {"reason": <FailoverReason name> (required), "retryable"/"should_compress"/
     # "should_rotate_credential"/"should_fallback": bool, "message": str, "error_context": dict}.
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
@@ -2074,7 +2074,7 @@ def get_plugin_error_classification(
         status_code=status_code, error_type=error_type, error_code=error_code,
         error_message=error_message, error_body=error_body if isinstance(error_body, dict) else {},
         error=error, approx_tokens=approx_tokens, context_length=context_length,
-        num_messages=num_messages,
+        num_messages=num_messages, call_id=os.urandom(8).hex(),  # the bounded dispatch's per-call gate key
     )
 
     def _reason(result: Any) -> Any:

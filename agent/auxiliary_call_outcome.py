@@ -50,11 +50,34 @@ def error_class(error: BaseException, *, provider: str = "", model: str = "") ->
     if not isinstance(error, Exception):
         return "unknown"
     try:
-        from agent.error_classifier import classify_api_error
+        from agent.auxiliary_error_policy import reported_verdict
 
+        # The recovery ladder's verdict for the attempt that raised this error (one classification per
+        # exception and route). An HTTP-200 error object is reported as the upstream failure it names (the
+        # ladder routes that answer as incomplete_response): its SDK-shaped copy is built once per error,
+        # so it too is classified once, on the attempt's route.
         embedded = getattr(error, PROVIDER_ERROR_ATTR, None)
-        target = _EmbeddedProviderError(embedded) if isinstance(embedded, dict) else error
-        return classify_api_error(target, provider=provider, model=model).reason.value
+        target = _embedded_copy(error, embedded) if isinstance(embedded, dict) else error
+        return reported_verdict(target, provider=provider, model=model).reason.value
     except Exception:
         logger.debug("Auxiliary error classification failed", exc_info=True)
         return "unknown"
+
+
+_EMBEDDED_COPY_ATTR = "_hermes_aux_embedded_error"
+
+
+def _embedded_copy(error: Exception, embedded: dict[str, Any]) -> Exception:
+    """``error``'s HTTP-200 error object as an SDK body bound to ``error``'s attempt route, kept on
+    ``error`` so every telemetry read of it shares one verdict cache."""
+    from agent.auxiliary_error_policy import same_attempt
+
+    copy = getattr(error, _EMBEDDED_COPY_ATTR, None)
+    if isinstance(copy, _EmbeddedProviderError):
+        return copy
+    copy = same_attempt(_EmbeddedProviderError(embedded), error)
+    try:
+        setattr(error, _EMBEDDED_COPY_ATTR, copy)
+    except (AttributeError, TypeError):  # an exception type without an instance dict
+        pass
+    return copy

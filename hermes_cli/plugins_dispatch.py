@@ -49,11 +49,16 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "pre_command",
     # Fires inside the compression commit window (lease held): a hung plugin must not wedge the session.
     "post_compaction",
+    # Consulted on every failed provider call, main loop and auxiliary (async callers classify on the
+    # event loop): a hung classifier must not wedge recovery; the built-in classification applies.
+    "transform_api_error_classification",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
 _HOOK_CALL_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
     "pre_command": ("session_key",), "post_compaction": ("session_id",),
+    # One classification per failed provider call: concurrent failures never skip each other.
+    "transform_api_error_classification": ("call_id",),
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).

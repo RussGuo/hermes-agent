@@ -2,6 +2,7 @@
 import contextlib
 from typing import Any, Optional
 
+from agent import auxiliary_error_policy as aux_errors
 from hermes_cli.route_identity import normalize_route_base_url
 
 def _unhealthy_cache_key(provider: str, base_url: Optional[str] = None) -> Any:
@@ -41,33 +42,31 @@ def _custom_health_base_url(provider: str, explicit_base_url: Optional[str] = No
 
 
 def fallback_candidate_unavailable_reason(exc: Exception) -> Optional[str]:
-    """Why a fallback candidate cannot serve this walk (``_FALLBACK_REASONS`` label), or None.
+    """Why a fallback candidate cannot serve this walk (``aux_errors.fallback_label``), or None.
 
-    The same capacity classes that admitted the primary failure into the chain (payment/quota,
-    rate limit, connection, route-incompatible model, malformed response) mean "this lane is out
-    for now, try the next configured one"; anything else (a 400 request-shape error, a ValueError)
-    is the caller's bug and must still propagate. Auth errors are excluded on purpose: they have
-    their own refresh-then-quarantine path in the candidate helpers (#106367)."""
-    from agent.auxiliary_client import _FALLBACK_REASONS
-    return next(
-        (label for predicate, label in _FALLBACK_REASONS if label != "auth error" and predicate(exc)),
-        None,
-    )
+    The same classes that admitted the primary failure into the chain (payment/quota, rate limit,
+    transport, overload, missing or gated model, malformed response, a non-refreshable auth refusal)
+    mean "this lane is out for now, try the next configured one"; anything else (a 400 request-shape
+    error, a ValueError) is the caller's bug and must still propagate, unless the candidate's own
+    parameter repair already changed the request and it still failed. A refreshable auth error is
+    refreshed first by the candidate helpers (#106367)."""
+    return aux_errors.fallback_label(exc, rung_spent=aux_errors.noted_rung_spent(exc))
 
 
-# Quarantine hold per unavailable-reason label. Payment/quota depletion and a dead credential
-# last hours, so those keep the long default TTL (None); a per-minute 429, a dropped connection or
-# a garbled body clears in seconds — holding the lane for 10 minutes process-wide would hide a
-# healthy fallback from every aux task over one transient blip.
+# Quarantine hold per unavailable-reason label. A per-minute 429, a dropped connection,
+# a busy or failing server or a garbled body clears in seconds — holding the lane for 10 minutes
+# process-wide would hide a healthy fallback from every aux task over one transient blip. Every other
+# label (payment/quota depletion, auth, a timeout, a gated or missing model, a stale credential, any
+# other fallback reason) keeps the long default hold.
 _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS = 60.0
-_CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
-    "rate limit": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
-    "connection error": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
-    "invalid provider response": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
-}
+_DEFAULT_CANDIDATE_QUARANTINE: Optional[float] = None  # _mark_provider_unhealthy's default TTL
+_CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = dict.fromkeys((
+    aux_errors.RATE_LIMIT, aux_errors.CONNECTION_ERROR, aux_errors.INVALID_RESPONSE,
+    aux_errors.PROVIDER_OVERLOADED, aux_errors.SERVER_ERROR,
+), _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS)
 
 
 def fallback_candidate_quarantine_ttl(reason: Optional[str]) -> Optional[float]:
-    """Seconds to hide a fallback candidate for ``reason`` (a ``_FALLBACK_REASONS`` label, or None
+    """Seconds to hide a fallback candidate for ``reason`` (an ``aux_errors.fallback_label``, or None
     for a stale credential); None means the long default TTL."""
-    return _CANDIDATE_QUARANTINE_TTL.get(reason or "")
+    return _CANDIDATE_QUARANTINE_TTL.get(reason or "", _DEFAULT_CANDIDATE_QUARANTINE)

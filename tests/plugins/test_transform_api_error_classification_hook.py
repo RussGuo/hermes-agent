@@ -105,6 +105,37 @@ def test_first_valid_result_wins(monkeypatch):
     assert result.reason == FailoverReason.billing
 
 
+def test_concurrent_classifications_each_consult_the_plugin(monkeypatch):
+    """The hook is time-bounded; each failed call is its own invocation, so a classification still
+    running for one call (an outage failing several sessions at once) never skips another's."""
+    import threading
+
+    from hermes_cli.plugins import PluginManager
+
+    all_running = threading.Barrier(3)
+
+    def slow_billing(**_kwargs):
+        all_running.wait(timeout=5.0)  # returns only once every classification is inside the callback
+        return {"reason": "billing"}
+
+    mgr = PluginManager()
+    mgr._discovered = True
+    mgr._hooks["transform_api_error_classification"] = [slow_billing]
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: mgr)
+    monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 5.0)
+    results: list = [None] * 3
+
+    def classify(i):
+        results[i] = plugins_mod.get_plugin_error_classification(provider="acmecloud", error_message="boom")
+
+    threads = [threading.Thread(target=classify, args=(i,)) for i in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10.0)
+    assert [r and r["reason"] for r in results] == [FailoverReason.billing] * 3
+
+
 def test_skipped_valid_results_log_runtime_warning(monkeypatch, caplog):
     # The #64714 skipped-transform rule: a valid-but-losing classification
     # must surface in logs, never be silently shadowed. Invalid results

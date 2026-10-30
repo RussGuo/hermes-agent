@@ -18,9 +18,13 @@ def _parameter_ladder(first_err: Exception, client: Any, kwargs: dict[str, Any],
                             "tag": tag, "async_mode": bool(tag), "resolved_provider": "",
                             "base_info": str(getattr(client, "base_url", "") or "")})
     max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
-    resp, err, _ = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
+    resp, err, stripped = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
     if err is None:
         return resp
+    if stripped is not kwargs:
+        # The repair changed the request and it still failed: the candidate is out, not the request.
+        from agent import auxiliary_error_policy as aux_errors
+        aux_errors.note_rung_spent(err)
     raise err
 
 
