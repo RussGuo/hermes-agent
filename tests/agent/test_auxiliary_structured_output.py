@@ -17,8 +17,8 @@ from agent.auxiliary_client import (
     _build_call_kwargs,
     _call_fallback_candidate_async,
     _call_fallback_candidate_sync,
-    _is_structured_output_rejection,
 )
+from agent.error_classifier import is_structured_output_rejection
 
 _JSON_SCHEMA = {"type": "json_schema", "json_schema": {"name": "t", "strict": True, "schema": {"type": "object"}}}
 _DEEPSEEK_400 = ("Error code: 400 - {'error': {'message': 'This response_format type is unavailable now', "
@@ -130,7 +130,7 @@ def test_rejection_memo_is_per_model_and_ignores_schema_validation_errors():
     validation_400 = _Rejects400(
         "Error code: 400 - Invalid schema for response_format 'json_schema': In context=(), "
         "'additionalProperties' is required to be supplied and to be false.")
-    assert _is_structured_output_rejection(validation_400)  # still drives the one-shot retry ...
+    assert is_structured_output_rejection(validation_400)  # still drives the one-shot retry ...
     structured_output.remember_structured_output_rejection(
         "openai", "https://api.openai.com/v1",
         {"model": "gpt-5-mini", "extra_body": {"response_format": dict(_JSON_SCHEMA)}}, validation_400)

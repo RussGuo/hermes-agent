@@ -33,9 +33,9 @@ import pytest
 from agent.auxiliary_client import (
     call_llm,
     async_call_llm,
-    _is_structured_output_rejection,
     _without_structured_output_format,
 )
+from agent.error_classifier import is_structured_output_rejection
 
 
 _TITLE_RESPONSE_FORMAT = {
@@ -82,7 +82,7 @@ class TestIsStructuredOutputRejection:
         "Gemini HTTP 400 (INVALID_ARGUMENT): Invalid value at 'generation_config.response_schema.properties[0].value.type'",
     ])
     def test_matches_real_provider_messages(self, message):
-        assert _is_structured_output_rejection(RuntimeError(message)) is True
+        assert is_structured_output_rejection(RuntimeError(message)) is True
 
     @pytest.mark.parametrize("message", [
         # Unrelated 400s must NOT trigger a silent schema downgrade
@@ -95,12 +95,12 @@ class TestIsStructuredOutputRejection:
         "messages: Extra inputs are not permitted",
     ])
     def test_does_not_match_unrelated_errors(self, message):
-        assert _is_structured_output_rejection(RuntimeError(message)) is False
+        assert is_structured_output_rejection(RuntimeError(message)) is False
 
     def test_does_not_match_non_400_statuses(self):
         exc = RuntimeError("output_config: Extra inputs are not permitted")
         exc.status_code = 500
-        assert _is_structured_output_rejection(exc) is False
+        assert is_structured_output_rejection(exc) is False
 
 
 class TestWithoutStructuredOutputFormat:

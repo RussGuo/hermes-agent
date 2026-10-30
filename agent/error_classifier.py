@@ -8,6 +8,7 @@ retry loop in run_agent.py consults instead of re-matching strings itself.
 from __future__ import annotations
 
 import enum
+import itertools
 import json
 import logging
 import re
@@ -100,13 +101,16 @@ class ClassifiedError:
 # Anthropic OAuth Pro/Max overage bucket depleted (HTTP 400).
 # The Nous gateway's own words for "the free tier will not serve this" — a billing wall for a
 # named account, the tier refusing for an anonymous one (see ``_WELCOME_403_NAMED_PATTERNS``).
-_FREE_TIER_REFUSAL_PATTERNS = ("model_not_supported_on_free_tier", "not available on the free tier")
+_FREE_TIER_REFUSAL_PATTERNS = (
+    "model_not_supported_on_free_tier", "not available on the free tier", "isn't available on the free tier")
 _BILLING_PATTERNS = (
     "insufficient credits", "insufficient_quota", "insufficient balance", "credit balance",
     "credits exhausted", "credits have been exhausted", "requires available credits",
     "account balance is too low", "no usable credits", "top up your credits", "payment required",
     "billing hard limit", "exceeded your current quota", "account is deactivated", "plan does not include",
-    "out of extra usage", "out of funds", "run out of funds", "balance_depleted",
+    "out of extra usage", "out of funds", "run out of funds", "balance_depleted", "insufficient funds",
+    # OpenRouter's credit-limited 402 names the affordable output budget ("... can only afford 7117").
+    "can only afford",
     # OpenRouter org-level monthly cap arrives as 403 "Budget limit exceeded (monthly limit)" (#107166):
     # account exhaustion, not a credential problem.
     "budget limit exceeded",
@@ -117,6 +121,26 @@ _BILLING_PATTERNS = (
     # "non-terminal billing limit" wording, and the structured code covers it.
     "hard billing limit",
 )
+
+# A named daily/weekly window (per-day token budget, daily or weekly limit, a spent session
+# allowance): the provider stays refused for hours, not seconds, so with no reset signal it is
+# billing. A bare RESOURCE_EXHAUSTED (NIM "Worker local total request limit reached (32/32)") or a
+# per-minute "Allocated quota exceeded" throttle names no such window and stays a rate limit.
+_LONG_QUOTA_WINDOW_PATTERNS = (
+    "tokens per day", "daily limit", "daily quota", "weekly usage limit", "weekly limit",
+    "reached your session usage limit",
+)
+# Any of these (or a long window) marks ``error_context["quota_exhausted"]``: the auxiliary client
+# benches the provider rather than re-sending to it on the next call, whatever the reason.
+_QUOTA_WINDOW_PATTERNS = _LONG_QUOTA_WINDOW_PATTERNS + (
+    "quota exceeded", "quota_exceeded", "upgrade for higher limits")
+# 403 subscription walls (Ollama Cloud "this model requires a subscription, upgrade for access").
+_SUBSCRIPTION_WALL_PATTERNS = ("requires a subscription", "upgrade for access")
+# An account wall on a status that may carry one (403, 404, 429, none): spent credit, an org budget or key
+# cap, a quota window or a subscription wall. Broader than _BILLING_PATTERNS (which also reads 400s and
+# 5xx), as the auxiliary client's payment rule was; bare "billing" is not one.
+_ACCOUNT_WALL_PATTERNS = (("key limit exceeded", "spending limit", "credits", "budget limit") + _BILLING_PATTERNS
+                          + _QUOTA_WINDOW_PATTERNS + _SUBSCRIPTION_WALL_PATTERNS)
 
 # Not proof of exhaustion: Anthropic returns the same "out of extra usage" body
 # for a content-filter rejection (#82154). Verdict stays ``billing`` but is
@@ -148,13 +172,18 @@ _BILLING_ERROR_CODES = frozenset({
     "insufficient_credits_for_paid_model",
 })
 
+# The Vertex/gRPC quota status and its SDK spellings: a rate limit on a 429 or with no status, an
+# account wall on a 403 or 404 (no throttle answers with those).
+_RESOURCE_EXHAUSTED_PATTERNS = ("resource exhausted", "resource_exhausted", "resource-exhausted", "resourceexhausted")
+# An account wall on a 403 or a 404: its wording, or the gRPC quota status.
+_403_404_WALL_PATTERNS = _ACCOUNT_WALL_PATTERNS + _RESOURCE_EXHAUSTED_PATTERNS
+
 # Transient rate limiting. Bedrock "Throttling error: Too many tokens" also
 # contains an overflow phrase; rate limit is matched first so throttle wins.
 _RATE_LIMIT_PATTERNS = (
     "rate limit", "rate_limit", "too many requests", "throttled", "requests per minute",
     "tokens per minute", "requests per day", "try again in", "please retry after",
-    "resource exhausted", "resource_exhausted", "resource-exhausted", "resourceexhausted",
-    "rate increased too quickly", "throttlingexception", "too many concurrent requests",
+    *_RESOURCE_EXHAUSTED_PATTERNS, "rate increased too quickly", "throttlingexception", "too many concurrent requests",
     "servicequotaexceededexception", "throttling",
 )
 
@@ -174,6 +203,8 @@ _OVERLOADED_PATTERNS = (
 # Usage-limit patterns that need disambiguation (billing OR rate_limit), and
 # the signals that mark such a limit as transient (periodic quota, not billing).
 _USAGE_LIMIT_PATTERNS = ("usage limit", "quota", "limit exceeded", "key limit exceeded")
+# A quota wall on a 429 (billing unless the body is itself a rate-limit phrase or names a reset).
+_429_QUOTA_WALL_PATTERNS = ("usage_limit_reached",) + _USAGE_LIMIT_PATTERNS + _ACCOUNT_WALL_PATTERNS
 _USAGE_LIMIT_TRANSIENT_SIGNALS = (
     "try again", "retry", "resets at", "reset in", "resets in", "reset after", "available in",
     "wait", "requests remaining", "periodic", "window", "per minute", "per second",
@@ -278,9 +309,37 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 # Codex ChatGPT-account entitlement 400 — the account can never use the named slug (#71970, #106475).
 CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER = "model is not supported when using codex with a chatgpt account"
 
+# This account cannot use this model (gating, not a typo): another credential may. Only when the model
+# itself opens the clause: "this model", "the [id] model [id]", "'id' model", "model <id>" (an id may be an
+# Ollama tag with a colon), then "is not supported ... this account". "Streaming with this model", "the
+# model parameter temperature", "reasoning_effort for model o3" or "Streaming model" restrict a feature
+# or parameter. Checked after the request-shape rules so a rejected parameter stays format_error.
+_ACCOUNT_GATING_TAIL_RE = re.compile(r"\bis not supported (?:when using|for) this account")
+# A slug carries a digit, separator or quote (a trailing colon is a label: "vision: model ..."). The token
+# is possessive so a run of separators cannot backtrack (async aux classifies on the event loop).
+_MODEL_ID = r"(?=[^\s,]{0,64}[\d\-:/_.'\"`])[^\s,]{1,129}+(?<!:)"
+_ACCOUNT_GATED_MODEL_SUBJECT_RE = re.compile(
+    rf"(?:^|[^\w\s,]|\b\d{{3}})\s*(?:(?:the|this|that|your|requested)\s+(?:{_MODEL_ID}\s+)?model(?:\s+[^\s,]{{1,64}}+)?"
+    rf"|(?:{_MODEL_ID}\s+)?model\s+[^\s,]{{1,64}}+|{_MODEL_ID}\s+model)\s+$")
+# The route cannot serve this model or this request on it (a capability gap or an account/model-level
+# feature restriction, not the credential): no rotation or key bench; the auxiliary client reads the
+# ``route_rejects_model`` shape fact and moves to another provider.
+_ROUTE_MODEL_REJECTION_PATTERNS = (
+    "model is not supported", "model_not_supported", "does not support this model",
+    "is not supported when using", "not supported with this", "not supported for this account",
+)
+# The same wording about a request parameter ("Unsupported parameter: 'temperature' is not supported with
+# this model") is the request's own failure: ``rejects_parameter`` instead, which the auxiliary client
+# re-raises unless a parameter rung already changed the request. A feature (streaming, image input, tool
+# use) is not a parameter.
+_REQUEST_PARAMETER_SUBJECT_RE = re.compile(
+    r"\b(?:parameters?|temperature|top_[pk]|max_(?:completion_|output_)?tokens|reasoning_effort|response_format"
+    r"|tool_choice|(?:frequency|presence)_penalty|logprobs|logit_bias)\b")
+
 _MODEL_NOT_FOUND_PATTERNS = (
     "is not a valid model", "invalid model", "model not found", "model_not_found", "does not exist",
     "no such model", "unknown model", "unsupported model", "no endpoints found that support tool use",
+    "openrouter catalog",
     # Nous 404 when the provider retires a :free route — the slug is dead for every
     # credential, so fall back instead of burning retries (#123180). Unlike the free-tier
     # billing wording, the account's balance/tier is not what rejected the call.
@@ -382,9 +441,14 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = (
     "content exists risk", "data may contain inappropriate content", "data_inspection_failed",
 )
 
+# xAI answers an expired OAuth token with "unauthenticated:bad-credentials" (HTTP 403, or status-less
+# once a relay drops the status): semantically a 401, so the credential is refreshed/rotated.
+_BAD_CREDENTIALS_PATTERN = "bad-credentials"
+
 # Auth patterns (non-status-code signals).
 _AUTH_PATTERNS = (
     "invalid api key", "invalid_api_key", "gateway_auth_failed", "authentication", "unauthorized",
+    "error code: 401", _BAD_CREDENTIALS_PATTERN,
     "forbidden", "invalid token", "token expired", "token revoked", "access denied",
     # Codex backend rejecting an OAuth access token without a usable
     # ``chatgpt_account_id`` claim; arrives as a bare ``detail`` string.
@@ -416,21 +480,23 @@ _CONNECTION_MESSAGE_PATTERNS = (
     "upstream connect error",
 )
 
-# SSL names keep provider-wrapped SSL errors (chain lost) as transport, not
-# unknown; OpenAI SDK errors are not subclasses of Python builtins.
+# Transport class names the markers below do not catch; OpenAI SDK errors are not subclasses of
+# Python builtins.
 _TRANSPORT_ERROR_TYPES = frozenset({
-    "ReadTimeout", "ConnectTimeout", "PoolTimeout", "ConnectError", "RemoteProtocolError",
-    "ConnectionError", "ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError",
-    "TimeoutError", "ReadError", "ServerDisconnectedError",
-    "SSLError", "SSLZeroReturnError", "SSLWantReadError", "SSLWantWriteError", "SSLEOFError", "SSLSyscallError",
-    "APIConnectionError", "APITimeoutError",
+    "ConnectError", "RemoteProtocolError", "BrokenPipeError", "ReadError", "ServerDisconnectedError",
 })
+# Class-name markers of SDK transport errors (httpx/SDK timeouts, provider-wrapped SSL errors whose
+# chain is lost, botocore's EndpointConnectionError, aiohttp's ClientConnectorDNSError, a websocket
+# ConnectionClosed); a status-less error only (an HTTP status settles the verdict first).
+_TRANSPORT_TYPE_MARKERS = ("Connection", "Timeout", "DNS", "SSL")
 
 # Ambiguous disconnects (no status): transient hiccup OR a gateway dropping an
 # oversized request. A large session + one of these → context-overflow path.
 _SERVER_DISCONNECT_PATTERNS = (
-    "server disconnected", "peer closed connection", "connection reset by peer", "connection was closed",
+    "server disconnected", "peer closed connection", "connection reset", "connection was closed",
     "network connection lost", "unexpected eof", "incomplete chunked read",
+    # httpcore/httpx premature stream close, also when only the wrapped class name survives.
+    "response ended prematurely", "remoteprotocolerror", "localprotocolerror",
 )
 
 # Deterministic cert failures (proxy, missing CA, expired/self-signed) — fail
@@ -514,7 +580,7 @@ _REASONING_MANDATORY_PATTERN = "reasoning is mandatory"
 # field as "extra inputs are not permitted" (#109774). Enum-rejecting aggregators (commandcode.ai)
 # say "Invalid option: expected one of ..." with no "unsupported" anywhere, naming the field only
 # in the structured 'param' tail (#115277). Shared with the auxiliary retry ladder
-# (``agent.auxiliary_client._is_unsupported_parameter_error``).
+# (:func:`is_unsupported_parameter_error`).
 UNSUPPORTED_PARAM_MARKERS = (
     "unsupported parameter", "unsupported_parameter", "not supported", "does not support",
     "doesn't support", "is deprecated for this model",
@@ -614,6 +680,73 @@ def is_reasoning_field_rejection(error_msg: str) -> bool:
     return "unsupported" in near or any(m in msg for m in UNSUPPORTED_PARAM_MARKERS)
 
 
+# ── Parameter-rung detectors ────────────────────────────────────────────
+# Which request field a provider 400/422 rejected, for the auxiliary client's strip-and-retry rungs.
+# Not failover reasons: format_error cannot tell the rungs apart, so each rung keeps its own test.
+_PARAM_REJECTION_STATUSES = (None, 400, 422)
+
+
+def _rejected_request_shape(error: Exception) -> bool:
+    """No status, or a request-shape status (400/422): a field rejection can only arrive this way."""
+    return getattr(error, "status_code", None) in _PARAM_REJECTION_STATUSES
+
+
+def is_unsupported_parameter_error(error: Exception, param: str) -> bool:
+    """Provider 400 for an unsupported request parameter: the parameter name plus a generic
+    unsupported/unknown/unrecognized marker, so callers can retry without the key."""
+    param_lower = (param or "").lower()
+    msg = str(error).lower()
+    return bool(param_lower) and param_lower in msg and any(m in msg for m in UNSUPPORTED_PARAM_MARKERS)
+
+
+# vLLM grammar-backend failures name the translated parameter, not ours; Gemini native names its own
+# generationConfig keys ("response mime type" with tools pre-Gemini-3, an "Unknown name"/"Invalid value"
+# on response_schema / response_json_schema for a schema the surface cannot express).
+_STRUCTURED_OUTPUT_FIELD_MARKERS = (
+    "guided_grammar", "xgrammar", "compile_grammar_error", "response mime type", "response_schema",
+    "response_json_schema",
+)
+
+
+def is_structured_output_rejection(error: Exception) -> bool:
+    """Provider 400/422 rejecting the structured-output field, on either wire: OpenAI ``response_format``
+    (incl. vLLM's ``guided_grammar``/xgrammar failures) or Anthropic ``output_config.format`` ("Extra inputs
+    are not permitted"). Gateways validating the body with a strict pydantic model reject the OBJECT-form
+    json_schema by shape ("str type expected" on response_format.json_schema, 422). Callers tolerate an
+    unconstrained reply, so the reaction is one retry without the field."""
+    if not _rejected_request_shape(error):
+        return False
+    msg = str(error).lower()
+    if any(m in msg for m in _STRUCTURED_OUTPUT_FIELD_MARKERS):
+        return True
+    if "extra inputs are not permitted" in msg and ("response_format" in msg or "output_config" in msg):
+        return True
+    if "response_format" in msg and ("unavailable" in msg or "json_schema" in msg):
+        return True
+    return is_unsupported_parameter_error(error, "response_format") or is_unsupported_parameter_error(
+        error, "output_config")
+
+
+def rejects_reasoning_field(error: Exception) -> bool:
+    """Status-gated :func:`is_reasoning_field_rejection`: one retry without any reasoning field (#112781)."""
+    return _rejected_request_shape(error) and is_reasoning_field_rejection(str(error))
+
+
+def rejects_reasoning_disable(error: Exception) -> bool:
+    """Status-gated :func:`is_reasoning_required_rejection`: step the effort up to the floor instead
+    of dropping the field (agent/auxiliary_reasoning_floor.py)."""
+    return _rejected_request_shape(error) and is_reasoning_required_rejection(str(error))
+
+
+def is_max_tokens_rejection(error: Exception, base_url: str = "") -> bool:
+    """Provider rejecting the output cap. ZAI vision models (``bigmodel`` host) reject ``max_tokens``
+    with code 1210 and a message that never names the field."""
+    text = str(error)
+    return ("max_tokens" in text or "unsupported_parameter" in text
+            or is_unsupported_parameter_error(error, "max_tokens")
+            or ("1210" in text and "bigmodel" in (base_url or "")))
+
+
 def _billing_hints(error_msg: str) -> Verdict:
     """Billing verdict carrying the #82154 ambiguity marker when applicable."""
     ctx: dict[str, Any] = {}
@@ -628,6 +761,30 @@ def _first_match(error_msg: str, rules: Sequence[tuple[Sequence[str], Any]]) -> 
         if any(p in error_msg for p in patterns):
             return verdict(error_msg) if callable(verdict) else verdict
     return None
+
+
+def _is_model_entitlement_message(error_msg: str) -> bool:
+    """Account gating of the model itself, unless the body is a billing or quota wall or a parameter
+    rejection (the 400 path checks those first; the status-less path relies on this guard). A request
+    parameter in the subject ("The model tool_choice ...") is not a model id. Reads the first 8 gating
+    tails only: a refusal states it once or twice, and a body repeating it must not cost a scan per repeat."""
+    for tail in itertools.islice(_ACCOUNT_GATING_TAIL_RE.finditer(error_msg), 8):
+        subject = _ACCOUNT_GATED_MODEL_SUBJECT_RE.search(error_msg, max(0, tail.start() - 160), tail.start())
+        if subject and not _REQUEST_PARAMETER_SUBJECT_RE.search(error_msg, subject.start(), tail.start()):
+            return not _names_wall_or_parameter(error_msg)
+    return False
+
+
+# Account words that make a gating wording name a wall, not the route rejecting the model.
+_WALL_WORDS = _BILLING_PATTERNS + ("quota", "credits", "billing", "free tier", "free-tier")
+
+
+def _names_wall(error_msg: str) -> bool:
+    return any(p in error_msg for p in _WALL_WORDS)
+
+
+def _names_wall_or_parameter(error_msg: str) -> bool:
+    return _names_wall(error_msg) or any(p in error_msg for p in _400_VALIDATION_PATTERNS)
 
 
 # Image/tool-content 400s, ordered: multimodal recovery ≠ image shrink; corrupt
@@ -647,7 +804,8 @@ _OVERFLOW_AS_5XX_RULES = (
 # 404: Nous API surfaces credit depletion as a paid model vanishing from the
 # Free Tier (billing, not missing model); policy block before model_not_found.
 _404_RULES = (
-    (_BILLING_PATTERNS, _V_BILLING), (_PROVIDER_POLICY_BLOCKED_PATTERNS, _V_POLICY_BLOCKED),
+    (_403_404_WALL_PATTERNS, _V_BILLING),
+    (_PROVIDER_POLICY_BLOCKED_PATTERNS, _V_POLICY_BLOCKED),
     (_MODEL_NOT_FOUND_PATTERNS, _V_MODEL_NOT_FOUND),
 )
 
@@ -672,7 +830,7 @@ _MESSAGE_HEAD_RULES = ((_MEMORY_CEILING_PATTERNS, _V_OVERLOADED),
 # instead of rotating; policy block before model_not_found; timeout/connection
 # wording last, classified as transport (never compression).
 _MESSAGE_TAIL_RULES = (
-    (_OVERLOADED_PATTERNS, _V_OVERLOADED), (_BILLING_PATTERNS, _billing_hints),
+    (_OVERLOADED_PATTERNS, _V_OVERLOADED), (_ACCOUNT_WALL_PATTERNS, _billing_hints),
     (_RATE_LIMIT_PATTERNS, _V_RATE_LIMIT), (_EMPTY_PROVIDER_RESPONSE_PATTERNS, _V_SERVER_ERROR),
     (_CONTEXT_OVERFLOW_PATTERNS, _V_CONTEXT_OVERFLOW), (_AUTH_PATTERNS, _V_AUTH_ROTATE),
     (_PROVIDER_POLICY_BLOCKED_PATTERNS, _V_POLICY_BLOCKED), (_MODEL_NOT_FOUND_PATTERNS, _V_MODEL_NOT_FOUND),
@@ -889,6 +1047,9 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     # to format_error and a status-less block isn't left retryable (#18028).
     if any(p in msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
         return _V_CONTENT_BLOCKED
+    # xAI's expired-OAuth wording is a 401 whatever status carries it (403, 400, none).
+    if _BAD_CREDENTIALS_PATTERN in msg and "unauthenticated" in msg:
+        return _V_AUTH_ROTATE
     # Status-agnostic: the stream-relayed ban has no status, and a 403 variant is not a bad key.
     if any(p in msg for p in _ACCOUNT_POLICY_BLOCK_PATTERNS):
         return _V_POLICY_BLOCKED
@@ -939,8 +1100,11 @@ def _moa_special_cases(c: _Ctx) -> Optional[Verdict]:
     if c.provider_slug == "moa" and any(s in str(c.error) for s in _MOA_ADAPTER_SHAPE_BUGS):
         return _v(_R.format_error, retryable=False)
     # Persisted MoA preset name that was renamed/deleted — deterministic config error.
-    from agent.errors import MoAPresetNotFoundError
-    return _v(_R.model_not_found, retryable=False) if isinstance(c.error, MoAPresetNotFoundError) else None
+    from agent.errors import InvalidProviderResponseError, MoAPresetNotFoundError
+    if isinstance(c.error, MoAPresetNotFoundError):
+        return _v(_R.model_not_found, retryable=False)
+    # An HTTP-200 answer with no usable choices: this route cannot answer the request, another may.
+    return _v(_R.incomplete_response, **_ABORT_FALLBACK) if isinstance(c.error, InvalidProviderResponseError) else None
 
 
 def _by_error_code(c: _Ctx) -> Optional[Verdict]:
@@ -962,6 +1126,10 @@ def _by_message(c: _Ctx) -> Optional[Verdict]:
     head = _first_match(c.msg, _MESSAGE_HEAD_RULES)
     if head is not None:
         return head
+    if any(p in c.msg for p in _LONG_QUOTA_WINDOW_PATTERNS):
+        return _V_RATE_LIMIT if _has_usage_limit_transient_signal(c.msg, c.body, c.headers) else _V_BILLING
+    if _is_model_entitlement_message(c.msg):
+        return _V_MODEL_ENTITLEMENT
     usage_limit = any(p in c.msg for p in _USAGE_LIMIT_PATTERNS)
     return _classify_402(c.msg, dict) if usage_limit else _first_match(c.msg, _MESSAGE_TAIL_RULES)
 
@@ -996,8 +1164,14 @@ def _by_transport(c: _Ctx) -> Optional[Verdict]:
     # network call): as ``unknown`` it would burn every retry instantly.
     if c.error_type == "RuntimeError" and "consecutive stale attempts" in msg and "aborting this call" in msg:
         return _v(_R.timeout, **_ABORT_FALLBACK)
-    transport = c.error_type in _TRANSPORT_ERROR_TYPES or isinstance(c.error, (TimeoutError, ConnectionError, OSError))
-    return _V_TIMEOUT if transport else None
+    return _V_TIMEOUT if _is_transport_error(c.error) else None
+
+
+def _is_transport_error(exc: Any) -> bool:
+    name = type(exc).__name__
+    return (name in _TRANSPORT_ERROR_TYPES or any(marker in name for marker in _TRANSPORT_TYPE_MARKERS)
+            or isinstance(exc, (TimeoutError, ConnectionError, OSError)))
+
 
 
 def _by_status(c: _Ctx) -> Optional[Verdict]:
@@ -1032,16 +1206,24 @@ def classify_api_error(
     The credential is never included in the returned context."""
     from hermes_cli.anon_auth import is_anonymous_request
     status_code = _extract_status_code(error)
-    # Some SDK RateLimitErrors (OpenAI-compatible relays) may not set .status_code; force 429.
-    if status_code is None and type(error).__name__ == "RateLimitError":
-        status_code = 429
+    # Some SDK RateLimitError / AuthenticationError classes (OpenAI-compatible relays, provider SDKs)
+    # set no .status_code; the class names the status.
+    if status_code is None:
+        name = type(error).__name__
+        status_code = 429 if name == "RateLimitError" else 401 if "authenticationerror" in name.lower() else None
     body = _extract_error_body(error)
     c = _Ctx(
         error, status_code, body, _build_error_msg(error, body), provider, model,
         approx_tokens, context_length, num_messages, str(base_url or ""),
         anonymous=is_anonymous_request(provider, api_key),
     )
-    verdict = next((v for v in (stage(c) for stage in _STAGES) if v is not None), _V_UNKNOWN)
+    verdict, hooked = _V_UNKNOWN, False
+    for stage in _STAGES:
+        found = stage(c)
+        if found is not None:
+            verdict, hooked = found, stage in _HOOK_STAGES
+            break
+    verdict = _with_shape_context(c, verdict, hooked=hooked)
     message = _extract_message(error, body)
     if verdict["reason"] in (_R.auth, _R.auth_permanent):
         # An auth refusal from a non-stock route names the host, so a credential posted to the
@@ -1052,6 +1234,92 @@ def classify_api_error(
             message = f"{message} (endpoint: {host})"
     base = {"status_code": status_code, "provider": provider, "model": model, "message": message}
     return ClassifiedError(**{**base, **verdict})
+
+
+_HOOK_STAGES = (_plugin_verdict, _profile_verdict)
+
+# Exception type names that time out rather than fail to connect (``TimeoutError`` subclasses are
+# caught by isinstance; SDK classes such as openai's APITimeoutError are not builtin subclasses).
+_TIMEOUT_TYPE_MARKER = "Timeout"
+
+
+def _transport_kind(c: _Ctx, reason: FailoverReason) -> Optional[str]:
+    """``timeout`` for an attempt that spent its time budget, ``connection`` for any other transport
+    failure (refused, DNS, reset, dropped stream); None for a provider answer."""
+    if isinstance(c.error, TimeoutError) or _TIMEOUT_TYPE_MARKER in c.error_type or "timed out" in c.msg:
+        return "timeout"
+    return "connection" if reason is _R.timeout and not c.status_code else None
+
+
+def _statusless_structured(c: _Ctx) -> bool:
+    """A status-less SDK error whose body is a structured provider error: an SSE ``error`` event after
+    an HTTP-200 commit (#101538). Message text alone is not enough."""
+    if c.status_code is not None:
+        return False
+    body = getattr(c.error, "body", None)
+    err = body.get("error") if isinstance(body, dict) and "error" in body else body
+    if isinstance(err, str):
+        return bool(err.strip())
+    return isinstance(err, dict) and any(err.get(k) for k in ("type", "code", "message"))
+
+
+def _with_shape_context(c: _Ctx, verdict: Verdict, *, hooked: bool) -> Verdict:
+    """Add the shape facts recovery paths branch on to ``error_context`` (never to a shared verdict):
+    ``transport`` (timeout | connection), ``statusless_structured``, and, for built-in verdicts,
+    ``quota_exhausted`` when the body names a long quota window, ``route_rejects_model`` when a 400 or
+    status-less error says the route cannot serve the model, and ``rejects_parameter`` when that wording's
+    subject is a request parameter (a hook's verdict is authoritative)."""
+    extra: dict[str, Any] = {}
+    kind = _transport_kind(c, verdict["reason"])
+    if kind:
+        extra["transport"] = kind
+    if _statusless_structured(c):
+        extra["statusless_structured"] = True
+    if not hooked and c.status_code in (None, 402, 403, 404, 429) and any(p in c.msg for p in _QUOTA_WINDOW_PATTERNS):
+        extra["quota_exhausted"] = True
+    if (not hooked and c.status_code in (None, 400) and any(p in c.msg for p in _ROUTE_MODEL_REJECTION_PATTERNS)
+            and not _names_wall(c.msg)):
+        if _rejected_subject_is_parameter(c.msg):
+            extra["rejects_parameter"] = True
+        elif verdict["reason"] in (_R.format_error, _R.unknown):
+            extra["route_rejects_model"] = True
+    if not extra:
+        return verdict
+    return {**verdict, "error_context": {**(verdict.get("error_context") or {}), **extra}}
+
+
+def _rejected_subject_is_parameter(msg: str) -> bool:
+    """A request parameter is the subject of an unsupported clause: the text before the route wording,
+    back to its sentence start ("Remove the tools parameter." advice after a feature restriction is not).
+    One pass over the sorted wording hits, clause stops and parameter tokens (async aux classifies on the
+    event loop, so a body repeating the wording must stay linear)."""
+    hits = sorted(i for pattern in _ROUTE_MODEL_REJECTION_PATTERNS for i in _occurrences(msg, pattern))
+    if not hits:
+        return False
+    # (index the stop is complete at, clause start after it) and (start, end) of each parameter token.
+    stops = sorted((i + len(stop), i + 1) for stop in _CLAUSE_STOPS for i in _occurrences(msg, stop))
+    params = [m.span() for m in _REQUEST_PARAMETER_SUBJECT_RE.finditer(msg)]
+    clause_start, s, p, last_param = 0, 0, 0, None
+    for end in hits:
+        while s < len(stops) and stops[s][0] <= end:
+            clause_start = max(clause_start, stops[s][1])
+            s += 1
+        while p < len(params) and params[p][1] <= end:
+            last_param = params[p]
+            p += 1
+        if last_param is not None and last_param[0] >= clause_start:
+            return True
+    return False
+
+
+_CLAUSE_STOPS = (". ", "; ", "! ", "? ", "\n")
+
+
+def _occurrences(text: str, needle: str) -> Iterator[int]:
+    i = text.find(needle)
+    while i >= 0:
+        yield i
+        i = text.find(needle, i + 1)
 
 
 def _off_route_host(c: _Ctx) -> str:
@@ -1075,9 +1343,11 @@ _403_TRANSIENT_CODES = frozenset({"upstream_unavailable"})
 def _status_403(c: _Ctx) -> Verdict:
     if c.code in _403_TRANSIENT_CODES:
         return _V_OVERLOADED
-    # OpenRouter 403 "key limit exceeded" and similar plan/credit exhaustion are billing.
+    if _BAD_CREDENTIALS_PATTERN in c.msg:
+        return _V_AUTH_ROTATE
+    # OpenRouter 403 "key limit exceeded", quota/subscription walls and similar plan/credit exhaustion are billing.
     xai_spend = c.provider_slug == "xai-oauth" and c.code == _XAI_SPENDING_LIMIT_ERROR_CODE
-    billing = xai_spend or any(p in c.msg for p in ("key limit exceeded", "spending limit") + _BILLING_PATTERNS)
+    billing = xai_spend or any(p in c.msg for p in _403_404_WALL_PATTERNS)
     if billing:
         return _V_BILLING
     # A WAF/CDN in front of the provider answered, not the provider: the credential never
@@ -1117,15 +1387,18 @@ def _status_429(c: _Ctx) -> Verdict:
         upstream = _extract_upstream_provider_name(c.body)
         ctx = {"upstream_provider": upstream} if upstream else {}
         return _v(_R.upstream_rate_limit, should_fallback=True, error_context=ctx)
+    transient = _has_usage_limit_transient_signal(c.msg, c.body, c.headers)
+    # A named daily/weekly quota with no reset signal is spent for the window, even when the body
+    # also says RESOURCE_EXHAUSTED / "rate limit".
+    if not transient and any(p in c.msg for p in _LONG_QUOTA_WINDOW_PATTERNS):
+        return _V_BILLING
     # Quota walls as 429 (Anthropic ``usage_limit_reached``, "quota", billing
     # phrases) are billing ONLY when the body is not itself a rate-limit phrase
     # ("Rate limit exceeded" contains "limit exceeded") and carries no reset/
     # retry signal (#93419, #39441).
-    quota_wall = c.code == "usage_limit_reached" or any(
-        p in c.msg for p in ("usage_limit_reached",) + _USAGE_LIMIT_PATTERNS + _BILLING_PATTERNS
-    )
+    quota_wall = c.code == "usage_limit_reached" or any(p in c.msg for p in _429_QUOTA_WALL_PATTERNS)
     explicit_rate_limit = any(p in c.msg for p in _RATE_LIMIT_PATTERNS)
-    if quota_wall and not explicit_rate_limit and not _has_usage_limit_transient_signal(c.msg, c.body, c.headers):
+    if quota_wall and not explicit_rate_limit and not transient:
         return _V_BILLING
     # Carry the reset window so the terminal copy can name it instead of "wait a minute" (#89401).
     reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
@@ -1281,6 +1554,8 @@ def _classify_400(c: _Ctx) -> Verdict:
     # 400 whose wording a proxy stripped would fall through to format_error.
     if code in _MEMORY_CEILING_ERROR_CODES:
         return _V_OVERLOADED
+    if _is_model_entitlement_message(msg):
+        return _V_MODEL_ENTITLEMENT
     verdict = _first_match(msg, _400_TAIL_RULES)
     if verdict is not None:
         return verdict
@@ -1461,17 +1736,97 @@ def _body_message_candidates(body: dict) -> Iterator[Any]:
 
 
 def _from_cause_chain(error: Exception, pick: Callable[[Any], Any], default: Any) -> Any:
-    """First non-None ``pick(exc)`` over the error and its __cause__/__context__ chain (max 5 deep)."""
-    current = error
+    """First non-None ``pick(exc)`` over the error and its cause chain (max 5 deep, see ``_wrapped``)."""
+    current, implicit = error, True
     for _ in range(5):
         found = pick(current)
         if found is not None:
             return found
-        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        cause, explicit = _wrapped(current, implicit=implicit)
         if cause is None or cause is current:
             break
-        current = cause
+        current, implicit = cause, implicit and not explicit
     return default
+
+
+def _wrapped(exc: Any, *, implicit: bool = True) -> tuple[Any, bool]:
+    """``(wrapped, explicit)``: the exception ``exc`` wraps, its explicit ``__cause__``, else (only while
+    ``implicit``) the implicit ``__context__`` of a bare re-wrap: one raised in the very frame that caught
+    that context. An exception raised while handling another is a new attempt's own failure when it was
+    raised elsewhere (a call made inside the handler: a retry after a 401 credential refresh, its answer
+    check) or says so itself (``_is_own_failure``, or an invalid provider answer), so it never inherits the
+    401. Nor does the implicit context of an explicit cause: it belongs to an earlier attempt. (A bare
+    re-wrap whose own text names a timeout or disconnect classifies as that transport failure.) A
+    ``TimeoutError`` is the attempt's verdict even with an explicit cause: a watchdog deadline raised
+    ``from`` the stream's last error is still a timeout. Re-wrapping in a helper or a class ``__exit__``
+    reads as the helper's own failure: re-wrap in the handler itself or chain with ``from``."""
+    from agent.errors import InvalidProviderResponseError
+    if isinstance(exc, (InvalidProviderResponseError, TimeoutError)):
+        return None, True
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None or getattr(exc, "__suppress_context__", False):
+        return cause, True
+    context = getattr(exc, "__context__", None)
+    if not implicit or _is_own_failure(exc) or _raised_outside_handler(exc, context):
+        return None, False
+    return context, False
+
+
+def _raised_outside_handler(exc: Any, context: Any) -> bool:
+    """``exc`` was raised in a frame other than the one that caught ``context`` (frames are known only for
+    raised exceptions; an exception built with a hand-set context keeps the re-wrap reading)."""
+    tb, handler = getattr(exc, "__traceback__", None), getattr(getattr(context, "__traceback__", None), "tb_frame", None)
+    if tb is None or handler is None:
+        return False
+    while tb.tb_next is not None:  # the innermost entry is where ``exc`` was raised
+        tb = tb.tb_next
+    return tb.tb_frame is not handler
+
+
+_TRANSPORT_MESSAGE_PATTERNS = _CONNECTION_MESSAGE_PATTERNS + _SERVER_DISCONNECT_PATTERNS + _TIMEOUT_MESSAGE_PATTERNS
+
+
+def _is_own_failure(exc: Any) -> bool:
+    """A transport failure, a status, a body of any shape (an SSE ``{"error": "..."}`` string, a list,
+    bytes) or response text, a malformed payload (bad JSON or a provider stream-parse error), an SDK or
+    HTTP-client error (a body slot, a bound request or an HTTP-client module's class) with a message of
+    its own, or a message naming a transport failure. A bare re-wrap has none of these and inherits what
+    it was raised handling."""
+    from agent.api_error_summary import is_provider_stream_parse_error
+    if _is_transport_error(exc) or _status_of(exc) is not None or _carries_body(exc):
+        return True
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) or is_provider_stream_parse_error(exc):
+        return True
+    text = str(exc).lower()
+    return (bool(text.strip()) and _is_sdk_error(exc)) or any(p in text for p in _TRANSPORT_MESSAGE_PATTERNS)
+
+
+def _carries_body(exc: Any) -> bool:
+    body = getattr(exc, "body", None)
+    if isinstance(body, (str, bytes)):
+        return bool(body.strip())
+    if isinstance(body, (list, tuple)):
+        return bool(body)
+    if _body_of(exc) is not None:
+        return True
+    try:  # an unread httpx stream raises ResponseNotRead (a RuntimeError); a bad charset, a ValueError
+        text = getattr(getattr(exc, "response", None), "text", None)
+    except (RuntimeError, ValueError):
+        return False
+    return isinstance(text, str) and bool(text.strip())
+
+
+_HTTP_CLIENT_MODULES = frozenset({"httpx", "httpcore", "aiohttp", "requests", "urllib3"})
+
+
+def _is_sdk_error(exc: Any) -> bool:
+    """An SDK or HTTP-client error: a body slot, a bound request, or a class from an HTTP client."""
+    try:  # httpx's ``.request`` raises RuntimeError when unbound
+        request = getattr(exc, "request", None)
+    except RuntimeError:
+        request = None
+    return (request is not None or hasattr(exc, "body")
+            or type(exc).__module__.partition(".")[0] in _HTTP_CLIENT_MODULES)
 
 
 def _status_of(exc: Any) -> Optional[int]:
@@ -1479,7 +1834,15 @@ def _status_of(exc: Any) -> Optional[int]:
     if isinstance(code, int):
         return code
     code = getattr(exc, "status", None)  # some SDKs use .status
-    return code if isinstance(code, int) and 100 <= code < 600 else None
+    if isinstance(code, int) and 100 <= code < 600:
+        return code
+    # botocore's ClientError keeps its status in the parsed ``response`` dict (Bedrock: one attempt
+    # per call, so a 503 or a 429 ThrottlingException must classify like an SDK status error).
+    response = getattr(exc, "response", None)
+    meta = response.get("ResponseMetadata") if isinstance(response, dict) else None
+    code = meta.get("HTTPStatusCode") if isinstance(meta, dict) else getattr(response, "status_code", None)
+    # Also an HTTP client error that keeps its status only on the response (httpx ``HTTPStatusError``).
+    return code if isinstance(code, int) and not isinstance(code, bool) and 100 <= code < 600 else None
 
 
 def _body_of(exc: Any) -> Optional[dict]:

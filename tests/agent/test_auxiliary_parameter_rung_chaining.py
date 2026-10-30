@@ -12,10 +12,10 @@ from unittest.mock import MagicMock
 from agent.auxiliary_client import (
     _call_fallback_candidate_sync,
     _drive_ladder,
-    _is_reasoning_field_rejection,
     _ladder_parameter_rungs,
     _LadderRoute,
 )
+from agent.error_classifier import rejects_reasoning_field
 
 
 class _Bad400(Exception):
@@ -65,20 +65,20 @@ def test_primary_rungs_chain_in_provider_order_and_strip_each_field_once():
     assert not {"temperature", "max_tokens", "reasoning_effort"} & set(final_kwargs)
     # One retry per rejected field: reasoning_effort → temperature → max_tokens, nothing re-sent unchanged.
     assert client.chat.completions.create.call_count == 3
-    assert _is_reasoning_field_rejection(_Bad400("Extra inputs are not permitted, field: 'reasoning'"))
+    assert rejects_reasoning_field(_Bad400("Extra inputs are not permitted, field: 'reasoning'"))
 
 
 def test_reasoning_effort_none_unsupported_reversed_wording():
     """Relays that put the adjective last (``reasoning_effort 'none' unsupported; use ...``) fire the
     strip-and-retry rung like the forward wordings do; route gating that merely names a thinking
     model, or an adjective-only "unsupported" far from any reasoning field, does not."""
-    assert _is_reasoning_field_rejection(
+    assert rejects_reasoning_field(
         _Bad400("Error code: 400 - reasoning_effort 'none' unsupported; use minimal|low|medium|high|xhigh")
     )
-    assert not _is_reasoning_field_rejection(
+    assert not rejects_reasoning_field(
         _Bad400("The model kimi-k2-thinking is not supported when using this account")
     )
-    assert not _is_reasoning_field_rejection(_Bad400("reasoning models: tool_choice 'required' is unsupported"))
+    assert not rejects_reasoning_field(_Bad400("reasoning models: tool_choice 'required' is unsupported"))
 
 
 def test_structured_param_rejection_strips_reasoning_effort_on_retry():

@@ -29,9 +29,8 @@ from agent.local_prompt_progress import (
 from agent.error_classifier import (
     _BILLING_PATTERNS,
     _OVERLOADED_PATTERNS, FailoverReason, classify_api_error,
-    UNSUPPORTED_PARAM_MARKERS,
-    is_reasoning_field_rejection,
-    is_reasoning_required_rejection,
+    is_max_tokens_rejection, is_structured_output_rejection, is_unsupported_parameter_error,
+    rejects_reasoning_disable, rejects_reasoning_field,
 )
 from agent.auxiliary_error_shapes import (
     _botocore_error, _exc_http_status, _is_invalid_aux_response_error, _is_statusless_structured_provider_error,
@@ -3311,70 +3310,6 @@ def _is_auth_error(exc: Exception) -> bool:
         return True
     # xAI returns 403 "unauthenticated:bad-credentials" for expired OAuth tokens — semantically a 401.
     return "bad-credentials" in err_lower and (status == 403 or "unauthenticated" in err_lower)
-
-
-def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
-    """Provider 400 for an unsupported request parameter: the parameter name plus a generic
-    unsupported/unknown/unrecognized marker, so call sites can retry without the key."""
-    param_lower = (param or "").lower()
-    if not param_lower:
-        return False
-    err_lower = str(exc).lower()
-    return param_lower in err_lower and _contains_any(err_lower, UNSUPPORTED_PARAM_MARKERS)
-
-
-def _is_structured_output_rejection(exc: Exception) -> bool:
-    """Provider 400/422 rejecting the structured-output field, on either wire: OpenAI ``response_format``
-    (incl. vLLM's ``guided_grammar``/xgrammar failures) or Anthropic ``output_config.format`` ("Extra inputs
-    are not permitted"). Callers tolerate an unconstrained reply, so the reaction is one retry without it."""
-    status = getattr(exc, "status_code", None)
-    if status is not None and status not in {400, 422}:
-        return False
-    err_lower = str(exc).lower()
-    # vLLM grammar-backend failures name the translated parameter, not ours.
-    if _contains_any(err_lower, ("guided_grammar", "xgrammar", "compile_grammar_error")):
-        return True
-    if "extra inputs are not permitted" in err_lower and (
-        "response_format" in err_lower or "output_config" in err_lower
-    ):
-        return True
-    if "response_format" in err_lower and "unavailable" in err_lower:
-        return True
-    # Gateways that validate the request body with a strict pydantic model reject the
-    # OBJECT-form json_schema by shape ("str type expected" on response_format.json_schema,
-    # 422) rather than by naming the feature. The field is what they refuse; the retry
-    # without it is the same remedy, so treat the shape error as a rejection too.
-    if "response_format" in err_lower and "json_schema" in err_lower:
-        return True
-    # Gemini native names its own generationConfig keys, never ours: "Function calling with a response
-    # mime type: 'application/json' is unsupported" (pre-Gemini-3 + tools via a proxy), or an
-    # "Unknown name"/"Invalid value" 400 on response_schema / response_json_schema for a schema the
-    # surface cannot express. Same remedy: one retry without the format.
-    if _contains_any(err_lower, ("response mime type", "response_schema", "response_json_schema")):
-        return True
-    return _is_unsupported_parameter_error(exc, "response_format") or _is_unsupported_parameter_error(exc, "output_config")
-
-
-def _is_reasoning_field_rejection(exc: Exception) -> bool:
-    """Provider 400 rejecting a reasoning wire control by name (``reasoning_effort``, ``reasoning``,
-    ``thinking``/``think``). Chat-only models behind OpenAI-compatible relays reject the top-level
-    ``reasoning_effort: none`` a disabled ``reasoning_config`` projects on the custom profile
-    ("Unrecognized request argument supplied: reasoning_effort", #112781); the route default is
-    the right answer for such a model, so the reaction is one retry without any reasoning field."""
-    status = getattr(exc, "status_code", None)
-    if status is not None and status not in {400, 422}:
-        return False
-    return is_reasoning_field_rejection(str(exc))
-
-
-def _is_reasoning_required_rejection(exc: Exception) -> bool:
-    """Provider 400 refusing to switch reasoning OFF ("Reasoning is mandatory for this endpoint and cannot
-    be disabled"): the field is understood, only the disable is refused, so the rung steps the effort up to
-    the floor instead of dropping the field (agent/auxiliary_reasoning_floor.py)."""
-    status = getattr(exc, "status_code", None)
-    if status is not None and status not in {400, 422}:
-        return False
-    return is_reasoning_required_rejection(str(exc))
 
 
 def _without_reasoning_fields(kwargs: dict) -> Optional[dict]:
@@ -7461,9 +7396,9 @@ def _param_rung_accepts(exc: Exception) -> bool:
             # Parameter rungs chain in any order (a reasoning-strip retry can 400 on temperature,
             # a temperature-strip retry on max_tokens), and a route-gating 400 after a strip still
             # reaches the provider-fallback rung.
-            or _is_unsupported_parameter_error(exc, "temperature")
-            or _is_reasoning_field_rejection(exc) or _is_reasoning_required_rejection(exc)
-            or _is_structured_output_rejection(exc)
+            or is_unsupported_parameter_error(exc, "temperature")
+            or rejects_reasoning_field(exc) or rejects_reasoning_disable(exc)
+            or is_structured_output_rejection(exc)
             or _is_model_incompatible_error(exc))
 
 
@@ -7502,23 +7437,14 @@ def _without_max_tokens(kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k not in ("max_tokens", "max_completion_tokens")}
 
 
-def _is_max_tokens_rejection(exc: Exception, client: Any) -> bool:
-    err_str = str(exc)
-    # ZAI vision models reject max_tokens with code 1210 and a message that never
-    # mentions "max_tokens", so detect it explicitly.
-    is_zai_param_error = "1210" in err_str and "bigmodel" in str(getattr(client, "base_url", ""))
-    return ("max_tokens" in err_str or "unsupported_parameter" in err_str
-            or _is_unsupported_parameter_error(exc, "max_tokens") or is_zai_param_error)
-
-
 def _parameter_rungs(client: Any, max_tokens: Optional[int]) -> tuple:
     """Ordered ``(matches, strip, log message, remember)`` parameter rungs; ``strip`` returns None
     when the field was not on the wire, so an unchanged request is never re-sent; ``remember``
     (optional) records the rejection per route so the next call omits the field up front."""
     return (
-        (lambda exc: _is_unsupported_parameter_error(exc, "temperature"), _without_temperature,
+        (lambda exc: is_unsupported_parameter_error(exc, "temperature"), _without_temperature,
          "provider rejected temperature; retrying without it", remember_temperature_rejection),
-        (_is_structured_output_rejection, _without_structured_output_format,
+        (is_structured_output_rejection, _without_structured_output_format,
          "provider rejected the structured-output format field; retrying without it "
          "(schema enforcement degrades to prompt compliance)", remember_structured_output_rejection),
         # A chat-only model on an OpenAI-compatible relay rejects the profile's thinking-off encoding
@@ -7529,11 +7455,12 @@ def _parameter_rungs(client: Any, max_tokens: Optional[int]) -> tuple:
         # mandatory ... cannot be disabled"): step the effort up to the floor and remember the route so
         # the next thinking-off aux call starts there. Ordered before the strip so a floor that still
         # 400s falls through to it.
-        (_is_reasoning_required_rejection, with_reasoning_floor,
+        (rejects_reasoning_disable, with_reasoning_floor,
          "provider requires reasoning; retrying at the floor effort", remember_reasoning_floor),
-        (_is_reasoning_field_rejection, _without_reasoning_fields,
+        (rejects_reasoning_field, _without_reasoning_fields,
          "provider rejected the reasoning field; retrying without it (route default applies)", None),
-        (lambda exc: max_tokens is not None and _is_max_tokens_rejection(exc, client), _without_max_tokens,
+        (lambda exc: max_tokens is not None
+         and is_max_tokens_rejection(exc, str(getattr(client, "base_url", "") or "")), _without_max_tokens,
          "provider rejected the output cap; retrying without it", None),
     )
 

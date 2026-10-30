@@ -8,7 +8,7 @@ just ``temperature``. Credit @nicholasrae (PR #15416) for the generalization
 pattern.
 
 These tests lock in:
-  * ``_is_unsupported_parameter_error(exc, param)`` across common phrasings
+  * ``is_unsupported_parameter_error(exc, param)`` across common phrasings
   * the max_tokens retry branch no longer pops a key that was never set
     (``max_tokens is None`` gate)
   * the max_tokens retry branch matches via the generic helper on top of the
@@ -22,8 +22,8 @@ import pytest
 from agent.auxiliary_client import (
     call_llm,
     async_call_llm,
-    _is_unsupported_parameter_error,
 )
+from agent.error_classifier import is_unsupported_parameter_error
 
 
 class TestIsUnsupportedParameterError:
@@ -47,7 +47,7 @@ class TestIsUnsupportedParameterError:
         ("top_p", "Error: top_p is not supported for this model"),
     ])
     def test_matches_real_provider_messages(self, param, message):
-        assert _is_unsupported_parameter_error(RuntimeError(message), param) is True
+        assert is_unsupported_parameter_error(RuntimeError(message), param) is True
 
 
 
